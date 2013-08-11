@@ -22,9 +22,9 @@ endif
 SRCS := ray.c
 OBJS := $(patsubst %.c,%.o,$(SRCS))
 
-LIBS := ./libuv/libuv.a
+LIBS := ./libuv/out/Debug/libuv.a
 
-all: deps $(OBJS) ../libray.so
+all: ./libuv/libuv.a $(OBJS) ../libray.so
 
 ../libray.so: $(OBJS)
 	$(CC) $(COPT) -L./libuv $(LIBS) ray.c -o ../libray.so $(LDFLAGS)
@@ -32,7 +32,7 @@ all: deps $(OBJS) ../libray.so
 $(OBJS):
 	$(CC) -c $(CFLAGS) $(SRCS)
 
-deps:
+./libuv/libuv.a:
 	$(MAKE) CFLAGS="-fPIC" -C ./libuv
 
 clean:

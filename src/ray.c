@@ -1,260 +1,244 @@
 #include "ray.h"
 
-int ray_last_error(ray_ctx_t* self) {
-  uv_err_t err = uv_last_error(self->loop);
-  return err.code;
-}
 const char* ray_strerror(int code) {
-  uv_err_t err = { .code = code };
-  return uv_strerror(err);
+  return uv_strerror((uv_errno_t)code);
 }
 const char* ray_err_name(int code) {
-  uv_err_t err = { .code = code };
-  return uv_err_name(err);
+  return uv_err_name((uv_errno_t)code);
 }
 
-void ray_buf_need(ray_buf_t* buf, size_t len) {
-  size_t size = buf->size;
-  size_t need = buf->offs + len;
-  if (size == 0) {
-    ray_buf_init(buf);
-    size = buf->size;
-  }
-  if (need > buf->size) {
-    while (size < need) size *= 2;
-    buf->base = (char*)realloc(buf->base, size);
-    buf->size = size;
-  }
-  printf("buf->base: %p\n", buf->base);
-}
-void ray_buf_init(ray_buf_t* buf) {
-  buf->base = calloc(1, RAY_BUF_SIZE);
-  buf->size = RAY_BUF_SIZE;
-  buf->offs = 0;
-}
-void ray_buf_write(ray_buf_t* buf, const char* data, size_t len) {
-  ray_buf_need(buf, len);
-  memcpy(buf->base + buf->offs, data, len);
-  buf->offs += len;
-}
-const char* ray_buf_read(ray_buf_t* buf) {
-  buf->offs = 0;
-  return buf->base;
-}
-void ray_buf_clear(ray_buf_t* buf) {
-  memset(buf->base, 0, buf->size);
-  buf->offs = 0;
-}
-size_t ray_buf_get_offset(ray_buf_t* buf) {
-  return buf->offs;
-}
-
-ray_evt_t ray_evt_init(ray_agent_t* a, ray_type_t t, int i, void* d) {
+ray_evt_t ray_evt_init(ray_handle_t* h, ray_type_t t, int i, void* d) {
   ray_evt_t evt;
-  evt.self = a;
+  evt.self = h;
   evt.type = t;
   evt.info = i;
   evt.data = d;
-  printf("ray_evt_init - agent: %p, data: %p\n", a, d);
+  TRACE("ray_evt_init - handle: %p, data: %p\n", a, d);
   return evt;
 }
 
-void ray_ctx_async_cb(uv_async_t* async, int status) {
+void ray_queue_async_cb(uv_async_t* async, int status) {
   (void)async;
   (void)status;
 }
-void ray_ctx_timer_cb(uv_timer_t* timer, int status) {
-  ray_ctx_t* ctx = container_of(timer, ray_ctx_t, timer);
-  ray_interrupt(ctx);
+void ray_queue_timer_cb(uv_timer_t* timer, int status) {
+  ray_queue_t* queue = container_of(timer, ray_queue_t, timer);
+  ray_queue_interrupt(queue);
 }
 
-ray_ctx_t* ray_ctx_new(size_t size) {
-  ray_ctx_t* self = (ray_ctx_t*)malloc(sizeof(ray_ctx_t));
-  ray_ctx_init(self, size + (size % 2));
+ray_queue_t* ray_queue_new(size_t size) {
+  ray_queue_t* self = (ray_queue_t*)malloc(sizeof(ray_queue_t));
+  ray_queue_init(self, size + (size % 2));
   return self;
 }
-int ray_ctx_init(ray_ctx_t* self, size_t size) {
+
+int ray_queue_init(ray_queue_t* self, size_t size) {
   uv_loop_t* loop = uv_loop_new();
-  self->nput = 0;
-  self->nget = 0;
-  self->size = size;
+
   self->loop = loop;
   loop->data = (void*)self;
+
+  /* event pool */
+  self->nput_evts = 0;
+  self->nget_evts = 0;
+  self->size_evts = size;
   self->evts = calloc(size, sizeof(ray_evt_t));
 
-  uv_async_init(loop, &self->async, ray_ctx_async_cb);
+  /* message pool */
+  self->nput_msgs = 0;
+  self->nget_msgs = 0;
+  self->size_msgs = size;
+  self->msgs = calloc(size, sizeof(ray_msg_t));
+
+  uv_async_init(loop, &self->async, ray_queue_async_cb);
   uv_unref((uv_handle_t*)&self->async);
 
   uv_timer_init(loop, &self->timer);
   uv_unref((uv_handle_t*)&self->timer);
 
-  self->sys = ray_agent_new(self);
   return 0;
 }
 
-void ray_ctx_free(ray_ctx_t* self) {
-  ray_agent_free(self->sys);
+void ray_queue_free(ray_queue_t* self) {
   free(self->evts);
+  free(self->msgs);
   free(self);
 }
 
-ray_agent_t* ray_agent_new(ray_ctx_t* ctx) {
-  ray_agent_t* self = (ray_agent_t*)calloc(1, sizeof(ray_agent_t));
-  self->ctx = ctx;
+ray_handle_t* ray_handle_new(ray_queue_t* queue) {
+  ray_handle_t* self = (ray_handle_t*)calloc(1, sizeof(ray_handle_t));
+  self->queue = queue;
   return self;
 }
-void ray_agent_free(ray_agent_t* self) {
-  printf("free agent: %p\n", self);
+void ray_handle_free(ray_handle_t* self) {
   free(self);
 }
-int ray_evt_count(ray_ctx_t* self) {
-  if (self->nput > self->nget) {
-    return self->nput - self->nget;
+int ray_evt_count(ray_queue_t* self) {
+  if (self->nput_evts > self->nget_evts) {
+    return self->nput_evts - self->nget_evts;
   }
   else { // integer wrap
-    return self->nget - self->nput;
+    return self->nget_evts - self->nput_evts;
   }
 }
 
-void ray_post(ray_ctx_t* self, ray_evt_t* evt) {
-  assert(ray_evt_count(self) != self->size);
-  self->evts[self->nput++ % self->size] = *evt;
+ray_msg_t* ray_msg_next(ray_queue_t* self) {
+  ray_msg_t* next_msg_p = &self->msgs[(self->nput_msgs++) % self->size_msgs];
+  next_msg_p->queue = self;
+  return next_msg_p;
+}
+void ray_msg_done(ray_msg_t* msg) {
+  msg->queue->nget_msgs++;
 }
 
-ray_evt_t* ray_take(ray_ctx_t* self) {
-  if (ray_evt_count(self) == 0) return NULL;
-  return &self->evts[self->nget++ % self->size];
+void ray_queue_post(ray_queue_t* self, ray_evt_t* evt) {
+  assert(ray_evt_count(self) != self->size_evts);
+  if (ray_evt_count(self) == 0) {
+    ray_queue_interrupt(self);
+  }
+  ray_evt_t* next_evt_p = &self->evts[(self->nput_evts + 1) % self->size_evts];
+  assert(next_evt_p->data == NULL);
+  self->evts[self->nput_evts++ % self->size_evts] = *evt;
 }
-ray_evt_t* ray_peek(ray_ctx_t* self) {
+
+ray_evt_t* ray_queue_take(ray_queue_t* self) {
   if (ray_evt_count(self) == 0) return NULL;
-  return &self->evts[self->nget % self->size];
+  return &self->evts[self->nget_evts++ % self->size_evts];
 }
-ray_evt_t* ray_next(ray_ctx_t* self) {
+ray_evt_t* ray_queue_peek(ray_queue_t* self) {
+  if (ray_evt_count(self) == 0) return NULL;
+  return &self->evts[self->nget_evts % self->size_evts];
+}
+ray_evt_t* ray_queue_next(ray_queue_t* self) {
   int uv_again = 0;
   do {
-    printf("try UV_RUN_NOWAIT\n");
+    TRACE("try UV_RUN_NOWAIT\n");
     uv_again = uv_run(self->loop, UV_RUN_NOWAIT);
     if (ray_evt_count(self) != 0) break;
 
-    printf("try UV_RUN_ONCE\n");
+    TRACE("try UV_RUN_ONCE\n");
     uv_again = uv_run(self->loop, UV_RUN_ONCE);
-
-    printf("trigger\n");
 
     if (ray_evt_count(self) != 0) break;
   } while (uv_again);
-  if (ray_evt_count(self) != 0) return ray_take(self);
+  if (ray_evt_count(self) != 0) return ray_queue_take(self);
   return NULL;
 }
-void ray_done(ray_evt_t* evt) {
-  printf("ray_done: evt: %p, data: %p\n", evt, evt->data);
-  if (evt->data) free(evt->data);
+void ray_evt_done(ray_evt_t* evt) {
+  TRACE("ray_evt_done: evt: %p, data: %p\n", evt, evt->data);
+  if (evt->data != NULL) free(evt->data);
   evt->data = NULL;
-  printf("OK\n");
 }
 
-int ray_interrupt(ray_ctx_t* ctx) {
-  return uv_async_send(&ctx->async);
+int ray_queue_interrupt(ray_queue_t* queue) {
+  return uv_async_send(&queue->async);
 }
 
 /* ========================================================================== */
 /* streams                                                                    */
 /* ========================================================================== */
 void ray_close_cb(uv_handle_t* handle) {
-  ray_agent_t* self = container_of(handle, ray_agent_t, h);
+  ray_handle_t* self = container_of(handle, ray_handle_t, u);
   ray_evt_t evt = ray_evt_init(self, RAY_CLOSE, 0, NULL);
-  ray_post(self->ctx, &evt);
+  ray_queue_post(self->queue, &evt);
 }
-void ray_close(ray_agent_t* self) {
-  if (!uv_is_closing(&self->h.handle)) {
-    uv_close(&self->h.handle, ray_close_cb);
+void ray_close(ray_handle_t* self) {
+  if (!uv_is_closing(&self->u.handle)) {
+    uv_close(&self->u.handle, ray_close_cb);
   }
   else {
-    ray_evt_t evt = ray_evt_init(self, RAY_CLOSE, 0, NULL);
-    ray_post(self->ctx, &evt);
+    //ray_evt_t evt = ray_evt_init(self, RAY_CLOSE, 0, NULL);
+    //ray_queue_post(self->queue, &evt);
   }
 }
 
 uv_buf_t ray_alloc_cb(uv_handle_t* handle, size_t size) {
-  ray_agent_t* self = container_of(handle, ray_agent_t, h);
-  ray_buf_need(&self->buf, size);
-  return uv_buf_init(self->buf.base, size);
+  return uv_buf_init(malloc(1024), 1024);
 }
 
 void ray_read_cb(uv_stream_t* stream, ssize_t nread, uv_buf_t buf) {
-  printf("read_cb: nread %i\n", (int)nread);
-  ray_agent_t* self = container_of(stream, ray_agent_t, h);
-  if (nread == 0) return;
+  TRACE("read_cb: nread %i\n", (int)nread);
+  ray_handle_t* self = container_of(stream, ray_handle_t, u);
+  if (nread == 0) {
+    if (buf.base) free(buf.base);
+    return;
+  }
 
   ray_evt_t evt;
 
   if (nread > 0) {
-    evt = ray_evt_init(self, RAY_READ, nread, strndup(self->buf.base, nread));
+    evt = ray_evt_init(self, RAY_READ, nread, buf.base);
   }
   else {
-    uv_err_t err = uv_last_error(stream->loop);
-    evt = ray_evt_init(self, RAY_ERROR, err.code, NULL);
-    ray_close(self);
+    uv_errno_t err = nread;
+    evt = ray_evt_init(self, RAY_ERROR, err, NULL);
+    TRACE("ERROR : %s\n", uv_strerror(err));
+    if (buf.base) free(buf.base);
+    uv_read_stop(stream);
+    //ray_close(self);
   }
 
-  ray_post(self->ctx, &evt);
+  ray_queue_post(self->queue, &evt);
 }
 
 void ray_write_cb(uv_write_t* req, int status) {
-  printf("ray_write_cb\n");
-  ray_agent_t* self = container_of(req, ray_agent_t, r);
+  ray_handle_t* self = (ray_handle_t*)req->data;
   ray_evt_t evt = ray_evt_init(self, RAY_WRITE, status, NULL);
-  ray_post(self->ctx, &evt);
-  //ray_interrupt(self->ctx);
+  ray_queue_post(self->queue, &evt);
+  ray_msg_t* msg = container_of(req, ray_msg_t, u);
+  ray_msg_done(msg);
+  ray_queue_interrupt(self->queue);
 }
 
-int ray_read_start(ray_agent_t* self, size_t len) {
-  printf("ray_read_start: %p\n", self);
-  if (!len) len = RAY_BUF_SIZE;
-  printf("allocating buffer\n");
-  ray_buf_need(&self->buf, len);
-  printf("got buffer\n");
-  int rc = uv_read_start(&self->h.stream, ray_alloc_cb, ray_read_cb);
-  printf("uv_read_start returned: %i\n", rc);
+int ray_read_start(ray_handle_t* self) {
+  TRACE("ray_read_start: %p\n", self);
+  if (uv_is_closing(&self->u.handle)) {
+    ray_evt_t evt = ray_evt_init(self, RAY_ERROR, UV__EIO, NULL);
+    ray_queue_post(self->queue, &evt);
+    ray_queue_interrupt(self->queue);
+    return -1;
+  }
+  int rc = uv_read_start(&self->u.stream, ray_alloc_cb, ray_read_cb);
+  TRACE("uv_read returned: %i\n", rc);
   return rc;
 }
-int ray_read_stop(ray_agent_t* self) {
-  return uv_read_stop(&self->h.stream);
+int ray_read_stop(ray_handle_t* self) {
+  return uv_read_stop(&self->u.stream);
 }
 
-int ray_write(ray_agent_t* self, const char* str, size_t len) {
+int ray_write(ray_handle_t* self, const char* str, size_t len) {
   uv_buf_t buf = uv_buf_init((char*)str, (unsigned int)len);
-  int rc = uv_write(&self->r.write, &self->h.stream, &buf, 1, ray_write_cb);
-  printf("uv_write returned: %i\n", rc);
-  return rc;
+  ray_msg_t* msg = ray_msg_next(self->queue);
+  msg->u.req.data = self;
+  return uv_write(&msg->u.write, &self->u.stream, &buf, 1, ray_write_cb);
 }
 
 void ray_connection_cb(uv_stream_t* stream, int status) {
-  ray_agent_t* self = container_of(stream, ray_agent_t, h);
+  ray_handle_t* self = container_of(stream, ray_handle_t, u);
   ray_evt_t evt = ray_evt_init(self, RAY_CONNECTION, status, NULL);
-  printf("connection_cb on self %p\n", self);
-  ray_post(self->ctx, &evt);
+  TRACE("connection_cb on self %p\n", self);
+  ray_queue_post(self->queue, &evt);
 }
 
-int ray_listen(ray_agent_t* self, int backlog) {
-  return uv_listen(&self->h.stream, backlog, ray_connection_cb);
+int ray_listen(ray_handle_t* self, int backlog) {
+  return uv_listen(&self->u.stream, backlog, ray_connection_cb);
 }
 
-int ray_accept(ray_agent_t* server, ray_agent_t* client) {
-  return uv_accept(&server->h.stream, &client->h.stream);
+int ray_accept(ray_handle_t* server, ray_handle_t* client) {
+  return uv_accept(&server->u.stream, &client->u.stream);
 }
 
-void* ray_get_data(ray_agent_t* self) {
+void* ray_handle_get_data(ray_handle_t* self) {
   return self->data;
 }
-void ray_set_data(ray_agent_t* self, void* data) {
+void ray_handle_set_data(ray_handle_t* self, void* data) {
   self->data = data;
 }
 
-int ray_get_id(ray_agent_t* self) {
+int ray_handle_get_id(ray_handle_t* self) {
   return self->id;
 }
-void ray_set_id(ray_agent_t* self, int id) {
+void ray_handle_set_id(ray_handle_t* self, int id) {
   self->id = id;
 }
 
@@ -262,68 +246,67 @@ void ray_set_id(ray_agent_t* self, int id) {
 /* timers                                                                     */
 /* ========================================================================== */
 void ray_timer_cb(uv_timer_t* timer, int status) {
-  ray_agent_t* self = container_of(timer, ray_agent_t, h);
+  ray_handle_t* self = container_of(timer, ray_handle_t, u);
   ray_evt_t evt = ray_evt_init(self, RAY_TIMER, status, NULL);
-  ray_post(self->ctx, &evt);
+  ray_queue_post(self->queue, &evt);
 }
 
-ray_agent_t* ray_timer_new(ray_ctx_t* ctx) {
-  ray_agent_t* self = ray_agent_new(ctx);
-  if (uv_timer_init(ctx->loop, &self->h.timer)) return NULL;
+ray_handle_t* ray_timer_new(ray_queue_t* queue) {
+  ray_handle_t* self = ray_handle_new(queue);
+  if (uv_timer_init(queue->loop, &self->u.timer)) return NULL;
   return self;
 }
 
-int ray_timer_start(ray_agent_t* self, int64_t timeo, int64_t repeat) {
-  return uv_timer_start(&self->h.timer, ray_timer_cb, timeo, repeat);
+int ray_timer_start(ray_handle_t* self, int64_t timeo, int64_t repeat) {
+  return uv_timer_start(&self->u.timer, ray_timer_cb, timeo, repeat);
 }
-int ray_timer_stop(ray_agent_t* self) {
-  return uv_timer_stop(&self->h.timer);
+int ray_timer_stop(ray_handle_t* self) {
+  return uv_timer_stop(&self->u.timer);
 }
 
 /* ========================================================================== */
 /* TCP                                                                        */
 /* ========================================================================== */
-int ray_tcp_init(ray_agent_t* self) {
-  ray_buf_init(&self->buf);
-  return uv_tcp_init(self->ctx->loop, &self->h.tcp);
+int ray_tcp_init(ray_handle_t* self) {
+  return uv_tcp_init(self->queue->loop, &self->u.tcp);
 }
-ray_agent_t* ray_tcp_new(ray_ctx_t* ctx) {
-  ray_agent_t* self = ray_agent_new(ctx);
+ray_handle_t* ray_tcp_new(ray_queue_t* queue) {
+  ray_handle_t* self = ray_handle_new(queue);
   if (ray_tcp_init(self)) return NULL;
   return self;
 }
 
-int ray_tcp_bind(ray_agent_t* self, const char* host, int port) {
+int ray_tcp_bind(ray_handle_t* self, const char* host, int port) {
   struct sockaddr_in addr;
   addr = uv_ip4_addr(host, port);
-  return uv_tcp_bind(&self->h.tcp, addr);
+  return uv_tcp_bind(&self->u.tcp, addr);
 }
 
 /* ========================================================================== */
 /* idle                                                                       */
 /* ========================================================================== */
 void ray_idle_cb(uv_idle_t* idle, int status) {
-  ray_agent_t* self = container_of(idle, ray_agent_t, h);
+  ray_handle_t* self = container_of(idle, ray_handle_t, u);
   ray_evt_t evt = ray_evt_init(self, RAY_IDLE, status, NULL);
-  ray_post(self->ctx, &evt);
+  ray_queue_post(self->queue, &evt);
 }
 
-ray_agent_t* ray_idle_new(ray_ctx_t* ctx) {
-  ray_agent_t* self = ray_agent_new(ctx);
-  uv_idle_init(self->ctx->loop, &self->h.idle);
+ray_handle_t* ray_idle_new(ray_queue_t* queue) {
+  ray_handle_t* self = ray_handle_new(queue);
+  uv_idle_init(self->queue->loop, &self->u.idle);
   return self;
 }
-int ray_idle_start(ray_agent_t* self) {
-  return uv_idle_start(&self->h.idle, ray_idle_cb);
+int ray_idle_start(ray_handle_t* self) {
+  return uv_idle_start(&self->u.idle, ray_idle_cb);
 }
-int ray_idle_stop(ray_agent_t* self) {
-  return uv_idle_stop(&self->h.idle);
+int ray_idle_stop(ray_handle_t* self) {
+  return uv_idle_stop(&self->u.idle);
 }
 
 /* ========================================================================== */
 /* file system                                                                */
 /* ========================================================================== */
-void ray_stat_init(ray_stat_t* self, uv_statbuf_t* s) {
+void ray_stat_init(ray_stat_t* self, uv_stat_t* s) {
   if (s) {
     self->dev = s->st_dev;
     self->ino = s->st_ino;
@@ -333,17 +316,22 @@ void ray_stat_init(ray_stat_t* self, uv_statbuf_t* s) {
     self->gid = s->st_gid;
     self->rdev = s->st_rdev;
     self->size = s->st_size;
-    self->atime = s->st_atime;
-    self->mtime = s->st_mtime;
-    self->ctime = s->st_ctime;
+
+    self->atim.tv_sec = s->st_atim.tv_sec;
+    self->atim.tv_nsec = s->st_atim.tv_nsec;
+
+    self->mtim.tv_sec = s->st_mtim.tv_sec;
+    self->mtim.tv_nsec = s->st_mtim.tv_nsec;
+
+    self->ctim.tv_sec = s->st_ctim.tv_sec;
+    self->ctim.tv_nsec = s->st_ctim.tv_nsec;
   }
 }
 
 void ray_fs_cb(uv_fs_t* req) {
-  ray_agent_t* sys = container_of(req, ray_agent_t, r);
   ray_evt_t evt;
-  if (req->result == -1) {
-    evt = ray_evt_init(sys, RAY_ERROR, req->errorno, NULL);
+  if (req->result < 0) {
+    evt = ray_evt_init(NULL, RAY_ERROR, req->result, NULL);
   }
   else {
     int   type = -1;
@@ -453,33 +441,34 @@ void ray_fs_cb(uv_fs_t* req) {
       case UV_FS_STAT: {
         type = RAY_FS_STAT;
         data = malloc(sizeof(ray_stat_t));
-        ray_stat_init((ray_stat_t*)data, (uv_statbuf_t*)req->ptr);
+        ray_stat_init((ray_stat_t*)data, (uv_stat_t*)req->ptr);
         break;
       }
       case UV_FS_LSTAT: {
         type = RAY_FS_LSTAT;
         data = malloc(sizeof(ray_stat_t));
-        ray_stat_init((ray_stat_t*)data, (uv_statbuf_t*)req->ptr);
+        ray_stat_init((ray_stat_t*)data, (uv_stat_t*)req->ptr);
         break;
       }
       case UV_FS_FSTAT: {
         type = RAY_FS_READDIR;
         data = malloc(sizeof(ray_stat_t));
-        ray_stat_init((ray_stat_t*)data, (uv_statbuf_t*)req->ptr);
+        ray_stat_init((ray_stat_t*)data, (uv_stat_t*)req->ptr);
         break;
       }
 
       default: {
-        printf("Unhandled fs_type");
+        TRACE("Unhandled fs_type");
         abort();
       }
     }
-    evt = ray_evt_init(sys, type, info, data);
+    evt = ray_evt_init(NULL, type, info, data);
   }
 
   uv_fs_req_cleanup(req);
+  ray_msg_done(container_of(req, ray_msg_t, u));
 
-  ray_post(sys->ctx, &evt);
+  ray_queue_post((ray_queue_t*)req->loop->data, &evt);
 }
 
 int ray_str_flags(const char* str) {
@@ -504,13 +493,119 @@ int ray_str_flags(const char* str) {
   assert(0 && "Unknown file open flag");
 }
 
-int ray_fs_open(ray_ctx_t* ctx, const char *path, const char* how, int mode) {
+int ray_fs_open(ray_queue_t* queue, const char *path, const char* how, int mode) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
   int flags = ray_str_flags(how);
-  if (!mode) mode = 8;
-  return uv_fs_open(ctx->loop, &ctx->sys->r.fs, path, flags, mode, ray_fs_cb);
+  return uv_fs_open(queue->loop, req, path, flags, mode, ray_fs_cb);
 }
 
-int ray_fs_read(ray_ctx_t* ctx, ray_file_t fh, char* buf, size_t len, int64_t ofs) {
-  return uv_fs_read(ctx->loop, &ctx->sys->r.fs, fh, buf, len, ofs, ray_fs_cb); 
+int ray_fs_read(ray_queue_t* queue, ray_file_t fh, char* buf, size_t len, int64_t ofs) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_read(queue->loop, req, fh, buf, len, ofs, ray_fs_cb); 
+}
+
+int ray_fs_unlink(ray_queue_t* queue, const char* path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_unlink(queue->loop, req, path, ray_fs_cb);
+}
+
+int ray_fs_write(ray_queue_t* queue, ray_file_t file, void* buf, size_t len, int64_t ofs) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_write(queue->loop, req, file, buf, len, ofs, ray_fs_cb);
+}
+
+int ray_fs_mkdir(ray_queue_t* queue, const char* path, int mode) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_mkdir(queue->loop, req, path, mode, ray_fs_cb);
+}
+
+int ray_fs_rmdir(ray_queue_t* queue, const char* path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_rmdir(queue->loop, req, path, ray_fs_cb);
+}
+
+int ray_fs_readdir(ray_queue_t* queue, const char* path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_readdir(queue->loop, req, path, 0, ray_fs_cb);
+}
+
+int ray_fs_stat(ray_queue_t* queue, const char* path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_stat(queue->loop, req, path, ray_fs_cb);
+}
+
+int ray_fs_rename(ray_queue_t* queue, const char* old_path, const char* new_path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_rename(queue->loop, req, old_path, new_path, ray_fs_cb);
+}
+
+int ray_fs_sendfile(ray_queue_t* queue, ray_file_t ofh, ray_file_t ifh, int64_t ofs, size_t len) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_sendfile(queue->loop, req, ofh, ifh, ofs, len, ray_fs_cb);
+}
+
+int ray_fs_chmod(ray_queue_t* queue, const char* path, int mode) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_chmod(queue->loop, req, path, mode, ray_fs_cb);
+}
+
+int ray_fs_fchmod(ray_queue_t* queue, ray_file_t file, int mode) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_fchmod(queue->loop, req, file, mode, ray_fs_cb);
+}
+
+int ray_fs_utime(ray_queue_t* queue, const char* path, double atime, double mtime) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_utime(queue->loop, req, path, atime, mtime, ray_fs_cb);
+}
+
+int ray_fs_futime(ray_queue_t* queue, ray_file_t file, double atime, double mtime) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_futime(queue->loop, req, file, atime, mtime, ray_fs_cb);
+}
+
+int ray_fs_lstat(ray_queue_t* queue, const char* path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_lstat(queue->loop, req, path, ray_fs_cb);
+}
+
+int ray_fs_link(ray_queue_t* queue, const char* path, const char* new_path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_link(queue->loop, req, path, new_path, ray_fs_cb);
+}
+
+int ray_fs_symlink(ray_queue_t* queue, const char* p1, const char* p2, const char* f) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  int flags = ray_str_flags(f);
+  return uv_fs_symlink(queue->loop, req, p1, p2, flags, ray_fs_cb);
+}
+
+int ray_fs_readlink(ray_queue_t* queue, const char* path) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_readlink(queue->loop, req, path, ray_fs_cb);
+}
+
+int ray_fs_chown(ray_queue_t* queue, const char* path, int uid, int gid) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_chown(queue->loop, req, path, uid, gid, ray_fs_cb);
+}
+
+int ray_fs_fchown(ray_queue_t* queue, ray_file_t file, int uid, int gid) {
+  uv_fs_t* req = &(ray_msg_next(queue)->u.fs);
+  return uv_fs_fchown(queue->loop, req, file, uid, gid, ray_fs_cb);
+}
+
+int ray_cwd(char* buffer, size_t len) {
+  uv_errno_t err = uv_cwd(buffer, len);
+  return err;
+}
+
+int ray_chdir(const char* dir) {
+  uv_errno_t err = uv_chdir(dir);
+  return err;
+}
+
+int ray_exepath(char* buffer, size_t* size) {
+  return uv_exepath(buffer, size);
 }
 
